@@ -9,6 +9,7 @@ import {
     sanacionAdminRouter,
     sanacionWebhookRouter,
 } from "./routes/sanacion.routes.js";
+import { backfillPaidOrders } from "./services/sanacion.service.js";
 
 /* ───────────── Variables obligatorias ───────────── */
 const REQUIRED_ENV = [
@@ -59,10 +60,15 @@ app.use(
     "/api/sanacion/orders",
     rateLimit({ windowMs: 60_000, limit: 30, standardHeaders: true, legacyHeaders: false })
 );
-// Panel de administración (frena intentos de adivinar la contraseña)
+// Página de accesos: frena a quien intente adivinar códigos
+app.use(
+    "/api/sanacion/pass",
+    rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false })
+);
+// Panel de administración. El límite es alto porque en la puerta se escanea seguido.
 app.use(
     "/api/sanacion/admin",
-    rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false }),
+    rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: true, legacyHeaders: false }),
     sanacionAdminRouter
 );
 app.use("/api/sanacion", sanacionRouter);
@@ -83,6 +89,8 @@ app.use((err, _req, res, _next) => {
 try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("✅ MongoDB conectado");
+    // Órdenes pagadas antes de existir los QR reciben los suyos
+    await backfillPaidOrders().catch((err) => console.error("[sanacion] backfill de QR falló:", err.message));
     app.listen(PORT, () => console.log(`🚀 Sanación API en http://localhost:${PORT}`));
 } catch (err) {
     console.error("❌ No se pudo conectar a MongoDB:", err.message);

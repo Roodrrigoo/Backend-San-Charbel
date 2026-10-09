@@ -1,10 +1,15 @@
 import crypto from "node:crypto";
 import express, { Router } from "express";
 import {
+    checkIn,
+    checkInStats,
     createOrder,
+    getPass,
     getPublicOrder,
     handleStripeEvent,
     listGiftOrders,
+    searchOrders,
+    undoCheckIn,
     updateGift,
 } from "../services/sanacion.service.js";
 import { constructWebhookEvent } from "../services/stripe.service.js";
@@ -14,11 +19,12 @@ export const sanacionRouter = Router();
 
 // POST /api/sanacion/orders  { name, phone, tier?, quantity?, messages? }
 // Crea la orden "pending" y regresa el link de pago de Stripe con el folio adjunto.
-// messages: un texto por lugar Bienhechor (se ignora en General).
+// accessKey: llave privada para ver los QR en /sanacion/boleto/<accessKey> al pagar.
 sanacionRouter.post("/orders", async (req, res) => {
     const { order, paymentUrl } = await createOrder(req.body ?? {});
     res.status(201).json({
         folio: order.folio,
+        accessKey: order.accessKey,
         status: order.status,
         amount: order.expectedAmount,
         currency: order.currency,
@@ -29,6 +35,12 @@ sanacionRouter.post("/orders", async (req, res) => {
 // GET /api/sanacion/orders/:folio  -> estado (para la pantalla de "gracias")
 sanacionRouter.get("/orders/:folio", async (req, res) => {
     res.json(await getPublicOrder(req.params.folio));
+});
+
+// GET /api/sanacion/pass/:key  -> QR de una orden (accessKey) o de un regalo (código)
+sanacionRouter.get("/pass/:key", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(await getPass(req.params.key));
 });
 
 /* ───────────── Admin (Authorization: Bearer ADMIN_TOKEN) ───────────── */
@@ -55,6 +67,26 @@ sanacionAdminRouter.get("/gifts", async (_req, res) => {
 // PATCH /api/sanacion/admin/gifts/:code { recipientName?, recipientPhone?, status? }
 sanacionAdminRouter.patch("/gifts/:code", async (req, res) => {
     res.json({ gift: await updateGift(req.params.code, req.body ?? {}) });
+});
+
+// POST /api/sanacion/admin/checkin { code } -> valida y marca el QR como usado
+sanacionAdminRouter.post("/checkin", async (req, res) => {
+    res.json(await checkIn(req.body?.code));
+});
+
+// POST /api/sanacion/admin/checkin/undo { code } -> reactiva un QR escaneado por error
+sanacionAdminRouter.post("/checkin/undo", async (req, res) => {
+    res.json(await undoCheckIn(req.body?.code));
+});
+
+// GET /api/sanacion/admin/checkin/stats -> { total, used }
+sanacionAdminRouter.get("/checkin/stats", async (_req, res) => {
+    res.json(await checkInStats());
+});
+
+// GET /api/sanacion/admin/orders?q= -> asistentes pagados (todos los accesos)
+sanacionAdminRouter.get("/orders", async (req, res) => {
+    res.json({ orders: await searchOrders(req.query.q) });
 });
 
 /* ───────────── Webhook de Stripe (body RAW) ─────────────

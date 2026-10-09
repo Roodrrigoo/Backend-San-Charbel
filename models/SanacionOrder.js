@@ -5,9 +5,22 @@ const { Schema } = mongoose;
 export const ORDER_STATUS = ["pending", "processing", "paid", "expired", "failed"];
 export const GIFT_STATUS = ["available", "assigned", "delivered"];
 
+/* ───────────── Acceso (QR) ─────────────
+ * Uno por lugar pagado. El QR contiene el `code`; al escanearlo en la
+ * entrada se llena `usedAt` y ya no vuelve a servir.
+ */
+const ticketSchema = new Schema(
+    {
+        code: { type: String, required: true, uppercase: true, trim: true }, // p. ej. T26-7K3QXP2M
+        usedAt: { type: Date, default: null },
+    },
+    { _id: false }
+);
+
 /* ───────────── Boleto de regalo ─────────────
  * Cada lugar Bienhechor genera uno. Lleva el mensaje que escribió el
  * bienhechor y la comunidad lo asigna/entrega desde /sanacion/admin.
+ * Su `code` también es su QR de entrada.
  */
 const giftSchema = new Schema(
     {
@@ -24,6 +37,9 @@ const giftSchema = new Schema(
         recipientPhone: { type: String, default: "", trim: true },
         assignedAt: { type: Date, default: null },
         deliveredAt: { type: Date, default: null },
+
+        // Se llena cuando el QR del regalo se escanea en la entrada
+        usedAt: { type: Date, default: null },
     },
     { _id: false }
 );
@@ -32,6 +48,9 @@ const sanacionOrderSchema = new Schema(
     {
         // Folio visible para el asistente (también viaja a Stripe como client_reference_id)
         folio: { type: String, required: true, unique: true, index: true },
+
+        // Llave privada para ver los QR en /sanacion/boleto/<accessKey>
+        accessKey: { type: String },
 
         // Datos que captura el asistente antes de pagar (en lugar de login)
         name: { type: String, required: true, trim: true, maxlength: 120 },
@@ -59,6 +78,9 @@ const sanacionOrderSchema = new Schema(
         // "web" = creada por nuestra API · "stripe_direct" = alguien pagó con el link sin pasar por la página
         source: { type: String, enum: ["web", "stripe_direct"], default: "web" },
 
+        // Accesos con QR (se generan al confirmarse el pago): uno por lugar
+        tickets: { type: [ticketSchema], default: [] },
+
         // Boletos de regalo (sólo Bienhechor): uno por lugar, con el mensaje del bienhechor
         gifts: { type: [giftSchema], default: [] },
 
@@ -77,9 +99,14 @@ const sanacionOrderSchema = new Schema(
 
 sanacionOrderSchema.index({ phone: 1 });
 sanacionOrderSchema.index({ "stripe.sessionId": 1 }, { unique: true, sparse: true });
+sanacionOrderSchema.index({ accessKey: 1 }, { unique: true, sparse: true });
 // Panel de admin: bienhechores pagados, más recientes primero
 sanacionOrderSchema.index({ tier: 1, status: 1, paidAt: -1 });
-// Buscar / actualizar un regalo por su código
+// Escanear: buscar un QR por su código
+sanacionOrderSchema.index(
+    { "tickets.code": 1 },
+    { unique: true, partialFilterExpression: { "tickets.code": { $exists: true } } }
+);
 sanacionOrderSchema.index({ "gifts.code": 1 });
 
 export default mongoose.model("SanacionOrder", sanacionOrderSchema);
