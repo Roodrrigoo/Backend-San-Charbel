@@ -10,6 +10,7 @@ import {
     sanacionWebhookRouter,
 } from "./routes/sanacion.routes.js";
 import { backfillPaidOrders } from "./services/sanacion.service.js";
+import { seedFaqs } from "./services/content.service.js";
 
 /* ───────────── Variables obligatorias ───────────── */
 const REQUIRED_ENV = [
@@ -65,6 +66,17 @@ app.use(
     "/api/sanacion/pass",
     rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false })
 );
+// Preguntas desde la página: 5 cada 15 min por persona, para frenar spam
+app.post(
+    "/api/sanacion/questions",
+    rateLimit({
+        windowMs: 15 * 60_000,
+        limit: 5,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: "Ya enviaste varias preguntas. Intenta más tarde o escríbenos por WhatsApp." },
+    })
+);
 // Panel de administración. El límite es alto porque en la puerta se escanea seguido.
 app.use(
     "/api/sanacion/admin",
@@ -91,6 +103,8 @@ try {
     console.log("✅ MongoDB conectado");
     // Órdenes pagadas antes de existir los QR reciben los suyos
     await backfillPaidOrders().catch((err) => console.error("[sanacion] backfill de QR falló:", err.message));
+    // Primera vez: guarda las 6 preguntas frecuentes para poder editarlas desde el admin
+    await seedFaqs().catch((err) => console.error("[sanacion] no se pudieron crear las preguntas iniciales:", err.message));
     app.listen(PORT, () => console.log(`🚀 Sanación API en http://localhost:${PORT}`));
 } catch (err) {
     console.error("❌ No se pudo conectar a MongoDB:", err.message);

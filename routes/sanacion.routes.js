@@ -13,6 +13,19 @@ import {
     updateGift,
 } from "../services/sanacion.service.js";
 import { constructWebhookEvent } from "../services/stripe.service.js";
+import {
+    addVideo,
+    createFaq,
+    deleteQuestion,
+    deleteVideo,
+    getPublicContent,
+    getVideoSettings,
+    listQuestions,
+    reorderQuestions,
+    setActiveVideo,
+    submitQuestion,
+    updateQuestion,
+} from "../services/content.service.js";
 
 /* ───────────── API pública (JSON) ───────────── */
 export const sanacionRouter = Router();
@@ -41,6 +54,17 @@ sanacionRouter.get("/orders/:folio", async (req, res) => {
 sanacionRouter.get("/pass/:key", async (req, res) => {
     res.set("Cache-Control", "no-store");
     res.json(await getPass(req.params.key));
+});
+
+// GET /api/sanacion/content -> preguntas publicadas + video activo (para la página)
+sanacionRouter.get("/content", async (_req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(await getPublicContent());
+});
+
+// POST /api/sanacion/questions { question, name? } -> llega al admin como "nueva"
+sanacionRouter.post("/questions", async (req, res) => {
+    res.status(201).json(await submitQuestion(req.body ?? {}));
 });
 
 /* ───────────── Admin (Authorization: Bearer ADMIN_TOKEN) ───────────── */
@@ -87,6 +111,53 @@ sanacionAdminRouter.get("/checkin/stats", async (_req, res) => {
 // GET /api/sanacion/admin/orders?q= -> asistentes pagados (todos los accesos)
 sanacionAdminRouter.get("/orders", async (req, res) => {
     res.json({ orders: await searchOrders(req.query.q) });
+});
+
+// ── Preguntas ──
+// GET /api/sanacion/admin/questions -> todas (nuevas, publicadas, ocultas)
+sanacionAdminRouter.get("/questions", async (_req, res) => {
+    res.json({ questions: await listQuestions() });
+});
+
+// POST /api/sanacion/admin/questions { question, answer } -> pregunta frecuente ya publicada
+sanacionAdminRouter.post("/questions", async (req, res) => {
+    res.status(201).json({ question: await createFaq(req.body ?? {}) });
+});
+
+// PUT /api/sanacion/admin/questions/order { ids } -> orden de las publicadas
+sanacionAdminRouter.put("/questions/order", async (req, res) => {
+    res.json({ questions: await reorderQuestions(req.body?.ids) });
+});
+
+// PATCH /api/sanacion/admin/questions/:id { question?, answer?, status? }
+sanacionAdminRouter.patch("/questions/:id", async (req, res) => {
+    res.json({ question: await updateQuestion(req.params.id, req.body ?? {}) });
+});
+
+// DELETE /api/sanacion/admin/questions/:id
+sanacionAdminRouter.delete("/questions/:id", async (req, res) => {
+    res.json(await deleteQuestion(req.params.id));
+});
+
+// ── Video ──
+// GET /api/sanacion/admin/video -> { activeVideoId, videos }
+sanacionAdminRouter.get("/video", async (_req, res) => {
+    res.json(await getVideoSettings());
+});
+
+// POST /api/sanacion/admin/video { url, title?, vertical?, activate? }
+sanacionAdminRouter.post("/video", async (req, res) => {
+    res.status(201).json(await addVideo(req.body ?? {}));
+});
+
+// PUT /api/sanacion/admin/video/active { id } -> id null = no mostrar video
+sanacionAdminRouter.put("/video/active", async (req, res) => {
+    res.json(await setActiveVideo(req.body?.id ?? null));
+});
+
+// DELETE /api/sanacion/admin/video/:id
+sanacionAdminRouter.delete("/video/:id", async (req, res) => {
+    res.json(await deleteVideo(req.params.id));
 });
 
 /* ───────────── Webhook de Stripe (body RAW) ─────────────
