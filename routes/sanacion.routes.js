@@ -8,6 +8,7 @@ import {
     getPublicOrder,
     handleStripeEvent,
     listGiftOrders,
+    ownerGiftAction,
     searchOrders,
     undoCheckIn,
     updateGift,
@@ -19,6 +20,7 @@ import {
     deleteQuestion,
     deleteVideo,
     getPublicContent,
+    getUploadSignature,
     getVideoSettings,
     listQuestions,
     reorderQuestions,
@@ -56,7 +58,15 @@ sanacionRouter.get("/pass/:key", async (req, res) => {
     res.json(await getPass(req.params.key));
 });
 
-// GET /api/sanacion/content -> preguntas publicadas + video activo (para la página)
+// POST /api/sanacion/pass/:accessKey/gifts/:code { action, recipientName? }
+// El bienhechor comparte su regalo por WhatsApp, lo dona a la Iglesia o lo libera.
+// action "church-all" con code "all" dona todos los que aún no decide.
+sanacionRouter.post("/pass/:key/gifts/:code", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json(await ownerGiftAction(req.params.key, req.params.code, req.body ?? {}));
+});
+
+// GET /api/sanacion/content -> preguntas publicadas + video activo + precios (para la página)
 sanacionRouter.get("/content", async (_req, res) => {
     res.set("Cache-Control", "no-store");
     res.json(await getPublicContent());
@@ -108,9 +118,9 @@ sanacionAdminRouter.get("/checkin/stats", async (_req, res) => {
     res.json(await checkInStats());
 });
 
-// GET /api/sanacion/admin/orders?q= -> asistentes pagados (todos los accesos)
+// GET /api/sanacion/admin/orders?q=&status=paid|processing -> asistentes (pagados o esperando OXXO)
 sanacionAdminRouter.get("/orders", async (req, res) => {
-    res.json({ orders: await searchOrders(req.query.q) });
+    res.json({ orders: await searchOrders(req.query.q, req.query.status) });
 });
 
 // ── Preguntas ──
@@ -143,6 +153,11 @@ sanacionAdminRouter.delete("/questions/:id", async (req, res) => {
 // GET /api/sanacion/admin/video -> { activeVideoId, videos }
 sanacionAdminRouter.get("/video", async (_req, res) => {
     res.json(await getVideoSettings());
+});
+
+// POST /api/sanacion/admin/video/upload-signature -> firma para subir un video a Cloudinary
+sanacionAdminRouter.post("/video/upload-signature", async (_req, res) => {
+    res.json(getUploadSignature());
 });
 
 // POST /api/sanacion/admin/video { url, title?, vertical?, activate? }

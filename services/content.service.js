@@ -1,12 +1,18 @@
+import crypto from "node:crypto";
 import mongoose from "mongoose";
 import SanacionQuestion, { QUESTION_STATUS } from "../models/SanacionQuestion.js";
 import SanacionSettings from "../models/SanacionSettings.js";
-import { HttpError } from "./sanacion.service.js";
+import { HttpError, getPublicPrices } from "./sanacion.service.js";
 
 /* ───────────── Preguntas iniciales ─────────────
  * Se guardan en la base la primera vez que arranca el servidor;
  * desde ahí se editan en /sanacion/admin → Preguntas.
  */
+const OLD_BIENHECHOR_ANSWER =
+    "Por cada lugar Bienhechor, además de tu acceso preferente, la comunidad regala un acceso a alguien que lo necesita. Tú le escribes un mensaje, y se lo entregamos junto con su lugar.";
+const BIENHECHOR_ANSWER =
+    "Cada lugar Bienhechor incluye 2 accesos: el tuyo, en zona preferente, y uno más para regalar. Al pagar recibes los dos códigos QR. El de regalo lo puedes mandar tú mismo por WhatsApp a quien quieras, con un mensaje tuyo, o donarlo a la Iglesia para que la comunidad lo entregue a alguien que lo necesite.";
+
 const DEFAULT_FAQS = [
     {
         q: "¿Necesito pertenecer a algún grupo?",
@@ -22,7 +28,7 @@ const DEFAULT_FAQS = [
     },
     {
         q: "¿Qué significa ser Bienhechor?",
-        a: "Por cada lugar Bienhechor, además de tu acceso preferente, la comunidad regala un acceso a alguien que lo necesita. Tú le escribes un mensaje, y se lo entregamos junto con su lugar.",
+        a: BIENHECHOR_ANSWER,
     },
     {
         q: "¿Cómo recibo mi acceso?",
@@ -35,6 +41,11 @@ const DEFAULT_FAQS = [
 ];
 
 export const seedFaqs = async () => {
+    // Actualiza la respuesta de "Bienhechor" sólo si nadie la ha editado
+    await SanacionQuestion.updateOne(
+        { question: "¿Qué significa ser Bienhechor?", answer: OLD_BIENHECHOR_ANSWER },
+        { $set: { answer: BIENHECHOR_ANSWER } }
+    );
     if ((await SanacionQuestion.estimatedDocumentCount()) > 0) return;
     const now = new Date();
     await SanacionQuestion.insertMany(
@@ -152,9 +163,10 @@ const publicVideo = (v) => ({
 
 // GET /api/sanacion/content -> preguntas publicadas + video activo
 export const getPublicContent = async () => {
-    const [faqs, settings] = await Promise.all([
+    const [faqs, settings, prices] = await Promise.all([
         SanacionQuestion.find({ status: "published" }).sort({ order: 1, createdAt: 1 }).lean(),
         SanacionSettings.findOne({ key: "sanacion" }).lean(),
+        getPublicPrices(),
     ]);
     const active = settings?.activeVideoId
         ? settings.videos?.find((v) => String(v._id) === String(settings.activeVideoId))
@@ -162,6 +174,7 @@ export const getPublicContent = async () => {
     return {
         faqs: faqs.map((f) => ({ id: String(f._id), q: f.question, a: f.answer })),
         video: active ? { title: active.title ?? "", kind: active.kind, src: active.src, vertical: !!active.vertical } : null,
+        prices, // { general, bienhechor } en pesos, leídos de Stripe
     };
 };
 
@@ -323,4 +336,28 @@ export const deleteVideo = async (id) => {
     if (String(s.activeVideoId) === String(id)) update.$set = { activeVideoId: null };
     await SanacionSettings.updateOne({ key: "sanacion" }, update);
     return getVideoSettings();
+};
+
+/* ═════════════ ADMIN: SUBIR VIDEO DESDE EL DISPOSITIVO ═════════════
+ * El navegador del admin sube el archivo directo a Cloudinary (no pasa por
+ * Render). El backend sólo firma la subida para que nadie más pueda subir.
+ * Variables (opcionales): CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+ */
+const CLOUDINARY_FOLDER = "sanacion";
+
+export const getUploadSignature = () => {
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    const apiKey = process.env.CLOUDINARY_API_KEY;
+    const apiSecret = process.env.CLOUDINARY_API_SECRET;
+    if (!cloudName || !apiKey || !apiSecret) {
+        throw new HttpError(
+            400,
+            "Falta configurar Cloudinary en el servidor (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)."
+        );
+    }
+    const timestamp = Math.floor(Date.now() / 1000);
+    // Cloudinary firma los parámetros en orden alfabético + el secreto (SHA-1)
+    const toSign = `folder=${CLOUDINARY_FOLDER}&timestamp=${timestamp}`;
+    const signature = crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
+    return { cloudName, apiKey, timestamp, folder: CLOUDINARY_FOLDER, signature };
 };

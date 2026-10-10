@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import SanacionOrder from "../models/SanacionOrder.js";
-import { createCheckoutSession } from "./stripe.service.js";
+import { createCheckoutSession, getPaymentInfo, getPriceAmount } from "./stripe.service.js";
 
 export class HttpError extends Error {
     constructor(status, message) {
@@ -11,9 +11,9 @@ export class HttpError extends Error {
 
 /* ───────────── Catálogo de accesos ─────────────
  * Cada acceso usa un Price de Stripe (STRIPE_PRICE_*) en el .env.
- * La cantidad la elige el usuario en la página y se manda a Checkout.
- * Cada lugar Bienhechor genera además 1 boleto de regalo (gift) con el
- * mensaje que escribió el bienhechor; la comunidad lo asigna desde /sanacion/admin.
+ * El monto real se lee de Stripe (getPriceAmount); `price` es sólo el respaldo.
+ * Cada lugar Bienhechor = 2 accesos: 1 para quien compra + 1 de regalo, que
+ * el bienhechor comparte por WhatsApp o dona a la Iglesia.
  */
 const TIERS = {
     bienhechor: {
@@ -56,9 +56,11 @@ const generateCode = (prefix, length) => {
 const generateFolio = () => generateCode("ES26", 5);
 const newAccessKey = () => crypto.randomBytes(18).toString("base64url"); // 24 caracteres
 const newTicket = () => ({ code: generateCode("T26", 8), usedAt: null });
-const newGift = (message = "") => ({
+const newGift = (message = "", mode = "pending") => ({
     code: generateCode("REG", 6),
     message,
+    mode,
+    sharedAt: null,
     status: "available",
     recipientName: "",
     recipientPhone: "",
@@ -75,15 +77,33 @@ const normalizeCode = (raw) => {
 };
 
 const cleanText = (value, max) => String(value ?? "").trim().replace(/[ \t]+/g, " ").slice(0, max + 1);
+const cleanName = (value) => String(value ?? "").trim().replace(/\s+/g, " ");
 
 const isDuplicateKey = (err) => err?.code === 11000;
 
+/* ───────────── Precios (de Stripe, con respaldo) ───────────── */
+export const getTierPrice = async (tier) => {
+    const t = TIERS[tier];
+    try {
+        return await getPriceAmount(t.priceId());
+    } catch (err) {
+        console.warn(`[sanacion] no se pudo leer el precio de ${tier} en Stripe; uso ${t.price}:`, err.message);
+        return t.price;
+    }
+};
+
+export const getPublicPrices = async () => ({
+    general: await getTierPrice("general"),
+    bienhechor: await getTierPrice("bienhechor"),
+});
+
 /* ───────────── Accesos (QR) ─────────────
- * Garantiza que una orden pagada tenga su accessKey y un QR por lugar.
- * Los filtros evitan duplicar si dos peticiones llegan a la vez.
+ * Garantiza que una orden pagada tenga su accessKey, un QR por lugar y,
+ * si es Bienhechor, un regalo por lugar. Los filtros evitan duplicar si
+ * dos peticiones llegan a la vez.
  */
 const ensureTickets = async (order) => {
-    if (!order || order.status !== "paid") return order;
+    if (!order) return order;
     let changed = false;
 
     if (!order.accessKey) {
@@ -94,37 +114,57 @@ const ensureTickets = async (order) => {
         changed = true;
     }
 
-    const have = order.tickets?.length ?? 0;
-    if (have < order.quantity) {
-        const extra = Array.from({ length: order.quantity - have }, newTicket);
-        await SanacionOrder.updateOne(
-            { _id: order._id, [`tickets.${have}`]: { $exists: false } },
-            { $push: { tickets: { $each: extra } } }
-        );
-        changed = true;
+    if (order.status === "paid") {
+        const have = order.tickets?.length ?? 0;
+        if (have < order.quantity) {
+            const extra = Array.from({ length: order.quantity - have }, newTicket);
+            await SanacionOrder.updateOne(
+                { _id: order._id, [`tickets.${have}`]: { $exists: false } },
+                { $push: { tickets: { $each: extra } } }
+            );
+            changed = true;
+        }
+
+        if (order.tier === "bienhechor") {
+            const haveGifts = order.gifts?.length ?? 0;
+            if (haveGifts < order.quantity) {
+                const extra = Array.from({ length: order.quantity - haveGifts }, () => newGift(""));
+                await SanacionOrder.updateOne(
+                    { _id: order._id, [`gifts.${haveGifts}`]: { $exists: false } },
+                    { $push: { gifts: { $each: extra } } }
+                );
+                changed = true;
+            }
+        }
     }
 
     return changed ? SanacionOrder.findById(order._id).lean() : order;
 };
 
-// Al arrancar: órdenes pagadas antes de existir los QR reciben los suyos.
+// Al arrancar: órdenes pagadas antes de existir los QR/regalos reciben los suyos.
 export const backfillPaidOrders = async () => {
     const orders = await SanacionOrder.find({
         status: "paid",
         $or: [
             { accessKey: { $exists: false } },
             { $expr: { $lt: [{ $size: { $ifNull: ["$tickets", []] } }, "$quantity"] } },
+            {
+                tier: "bienhechor",
+                $expr: { $lt: [{ $size: { $ifNull: ["$gifts", []] } }, "$quantity"] },
+            },
         ],
     }).lean();
     for (const o of orders) await ensureTickets(o);
     if (orders.length) console.log(`[sanacion] QR generados para ${orders.length} órdenes ya pagadas`);
 };
 
-/* ───────────── Crear orden (antes de ir a Stripe) ───────────── */
-export const createOrder = async ({ name, phone, tier = "bienhechor", quantity = 1, messages = [] }) => {
-    const cleanName = String(name ?? "").trim().replace(/\s+/g, " ");
-    if (cleanName.length < 2) throw new HttpError(400, "Escribe tu nombre para emitir tu acceso.");
-    if (cleanName.length > 120) throw new HttpError(400, "El nombre es demasiado largo.");
+/* ───────────── Crear orden (antes de ir a Stripe) ─────────────
+ * giftMode (sólo Bienhechor): "self" = los comparto yo · "church" = los dono a la Iglesia
+ */
+export const createOrder = async ({ name, phone, tier = "bienhechor", quantity = 1, messages = [], giftMode = "self" }) => {
+    const n = cleanName(name);
+    if (n.length < 2) throw new HttpError(400, "Escribe tu nombre para emitir tu acceso.");
+    if (n.length > 120) throw new HttpError(400, "El nombre es demasiado largo.");
 
     const cleanPhone = normalizePhone(phone);
     if (cleanPhone.length !== 10) throw new HttpError(400, "Escribe tu WhatsApp a 10 dígitos.");
@@ -140,15 +180,19 @@ export const createOrder = async ({ name, phone, tier = "bienhechor", quantity =
         throw new HttpError(400, `Puedes reservar de 1 a ${MAX_QUANTITY} lugares por pago.`);
     }
 
-    // Un mensaje por lugar Bienhechor (opcionales; vacíos se permiten)
-    let giftMessages = [];
+    // Un regalo (con mensaje opcional) por lugar Bienhechor
+    let gifts = [];
     if (tierConfig.givesGift) {
         const list = Array.isArray(messages) ? messages : [];
-        giftMessages = Array.from({ length: qty }, (_, i) => cleanText(list[i], MAX_MESSAGE));
-        if (giftMessages.some((m) => m.length > MAX_MESSAGE)) {
+        const msgs = Array.from({ length: qty }, (_, i) => cleanText(list[i], MAX_MESSAGE));
+        if (msgs.some((m) => m.length > MAX_MESSAGE)) {
             throw new HttpError(400, `Cada mensaje puede tener hasta ${MAX_MESSAGE} caracteres.`);
         }
+        const mode = giftMode === "church" ? "church" : "pending";
+        gifts = msgs.map((m) => newGift(m, mode));
     }
+
+    const unitPrice = await getTierPrice(tier);
 
     // El folio es aleatorio; reintenta si por casualidad ya existe.
     let order;
@@ -157,13 +201,13 @@ export const createOrder = async ({ name, phone, tier = "bienhechor", quantity =
             order = await SanacionOrder.create({
                 folio: generateFolio(),
                 accessKey: newAccessKey(),
-                name: cleanName,
+                name: n,
                 phone: cleanPhone,
                 tier,
                 quantity: qty,
-                expectedAmount: tierConfig.price * qty,
+                expectedAmount: unitPrice * qty,
                 source: "web",
-                gifts: giftMessages.map((m) => newGift(m)),
+                gifts,
             });
         } catch (err) {
             if (!isDuplicateKey(err)) throw err;
@@ -204,28 +248,49 @@ export const getPublicOrder = async (folio) => {
 };
 
 /* ───────────── Página pública de accesos: /sanacion/boleto/:key ─────────────
- * key = accessKey de la orden (todos sus QR) o código de un regalo (su QR).
+ * key = accessKey de la orden (sus QR + sus regalos) o código de un regalo (su QR).
  */
 const publicTicket = (t) => ({ code: t.code, usedAt: t.usedAt ?? null });
+
+const publicMethod = (o) => {
+    const m = o.stripe?.paymentMethod;
+    return m?.type ? { type: m.type, brand: m.brand ?? "", last4: m.last4 ?? "", wallet: m.wallet ?? "" } : null;
+};
+
+// Lo que ve el bienhechor de cada regalo (sin el teléfono de quien lo recibe)
+const ownerGift = (g) => ({
+    code: g.code,
+    message: g.message ?? "",
+    mode: g.mode ?? "pending",
+    sharedAt: g.sharedAt ?? null,
+    recipientName: g.mode === "shared" ? g.recipientName ?? "" : "",
+    assigned: g.mode === "church" && (g.status ?? "available") !== "available",
+    usedAt: g.usedAt ?? null,
+});
+
+const orderPass = (order) => {
+    const paid = order.status === "paid";
+    return {
+        kind: "order",
+        status: order.status,
+        folio: order.folio,
+        name: order.name,
+        tier: order.tier,
+        quantity: order.quantity,
+        tickets: paid ? (order.tickets ?? []).map(publicTicket) : [],
+        gifts: paid && order.tier === "bienhechor" ? (order.gifts ?? []).map(ownerGift) : [],
+        paymentMethod: publicMethod(order),
+        oxxoVoucherUrl: order.status === "processing" ? order.stripe?.oxxoVoucherUrl ?? null : null,
+        oxxoExpiresAt: order.status === "processing" ? order.stripe?.oxxoExpiresAt ?? null : null,
+    };
+};
 
 export const getPass = async (rawKey) => {
     const key = String(rawKey ?? "").trim();
     if (!key || key.length > 64) throw new HttpError(404, "No encontramos este acceso.");
 
     let order = await SanacionOrder.findOne({ accessKey: key }).lean();
-    if (order) {
-        order = await ensureTickets(order);
-        const paid = order.status === "paid";
-        return {
-            kind: "order",
-            status: order.status,
-            folio: order.folio,
-            name: order.name,
-            tier: order.tier,
-            quantity: order.quantity,
-            tickets: paid ? (order.tickets ?? []).map(publicTicket) : [],
-        };
-    }
+    if (order) return orderPass(await ensureTickets(order));
 
     const code = normalizeCode(key);
     order = await SanacionOrder.findOne({ "gifts.code": code, status: "paid" }).lean();
@@ -238,10 +303,71 @@ export const getPass = async (rawKey) => {
             recipientName: gift.recipientName ?? "",
             message: gift.message ?? "",
             tickets: [publicTicket(gift)],
+            gifts: [],
         };
     }
 
     throw new HttpError(404, "No encontramos este acceso.");
+};
+
+/* ───────────── El bienhechor decide qué hacer con sus regalos ─────────────
+ * POST /pass/:key/gifts/:code { action, recipientName? }
+ *   share:       lo mandó por WhatsApp (queda "shared", con nombre opcional)
+ *   church:      lo dona a la Iglesia
+ *   reset:       cancela un envío/donación; el regalo vuelve a estar libre.
+ *                Si ya se había compartido, cambia el código: la liga anterior deja de servir.
+ *   church-all:  dona todos los que aún no decide (code = "all")
+ */
+export const ownerGiftAction = async (rawKey, rawCode, body = {}) => {
+    const key = String(rawKey ?? "").trim();
+    const order = await SanacionOrder.findOne({ accessKey: key, status: "paid", tier: "bienhechor" }).lean();
+    if (!order) throw new HttpError(404, "No encontramos este acceso.");
+
+    const action = String(body.action ?? "");
+
+    if (action === "church-all") {
+        await SanacionOrder.updateOne(
+            { _id: order._id },
+            { $set: { "gifts.$[g].mode": "church" } },
+            { arrayFilters: [{ "g.mode": { $in: ["pending", null] }, "g.usedAt": null }] } // null = regalos de antes de este cambio
+        );
+        return orderPass(await SanacionOrder.findById(order._id).lean());
+    }
+
+    const code = normalizeCode(rawCode);
+    const gift = order.gifts?.find((g) => g.code === code);
+    if (!gift) throw new HttpError(404, "No encontramos ese regalo.");
+    if (gift.usedAt) throw new HttpError(400, "Este regalo ya se usó en la entrada.");
+
+    const p = "gifts.$.";
+    const set = {};
+    const mode = gift.mode ?? "pending";
+
+    if (action === "share") {
+        if (mode === "church") throw new HttpError(400, "Este lugar ya lo donaste a la Iglesia.");
+        const rn = cleanName(body.recipientName);
+        if (rn.length > 120) throw new HttpError(400, "El nombre es demasiado largo.");
+        set[p + "mode"] = "shared";
+        set[p + "sharedAt"] = new Date();
+        if (body.recipientName !== undefined) set[p + "recipientName"] = rn;
+    } else if (action === "church") {
+        if (mode === "shared") throw new HttpError(400, "Este lugar ya lo compartiste. Cancela el envío primero.");
+        set[p + "mode"] = "church";
+    } else if (action === "reset") {
+        if (mode === "church" && (gift.status ?? "available") !== "available") {
+            throw new HttpError(400, "La comunidad ya asignó este lugar a alguien.");
+        }
+        if (mode === "shared") set[p + "code"] = generateCode("REG", 6); // la liga enviada deja de servir
+        set[p + "mode"] = "pending";
+        set[p + "sharedAt"] = null;
+        set[p + "recipientName"] = "";
+        set[p + "recipientPhone"] = "";
+    } else {
+        throw new HttpError(400, "Acción no válida.");
+    }
+
+    await SanacionOrder.updateOne({ _id: order._id, gifts: { $elemMatch: { code, usedAt: null } } }, { $set: set });
+    return orderPass(await SanacionOrder.findById(order._id).lean());
 };
 
 /* ───────────── Admin: entrada con QR ───────────── */
@@ -339,10 +465,12 @@ export const checkInStats = async () => {
     return { total, used };
 };
 
-// Buscar asistentes pagados por nombre, WhatsApp, folio o código
-export const searchOrders = async (rawQ = "") => {
+// Buscar asistentes por nombre, WhatsApp, folio o código.
+// status: "paid" (pagados) o "processing" (esperando pago en OXXO)
+export const searchOrders = async (rawQ = "", rawStatus = "paid") => {
+    const status = rawStatus === "processing" ? "processing" : "paid";
     const q = String(rawQ).trim().slice(0, 80);
-    const filter = { status: "paid" };
+    const filter = { status };
     if (q) {
         const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
         const digits = q.replace(/\D/g, "");
@@ -355,7 +483,10 @@ export const searchOrders = async (rawQ = "") => {
         ];
     }
 
-    const found = await SanacionOrder.find(filter).sort({ paidAt: -1 }).limit(50).lean();
+    const found = await SanacionOrder.find(filter)
+        .sort(status === "paid" ? { paidAt: -1 } : { updatedAt: -1 })
+        .limit(50)
+        .lean();
     const orders = [];
     for (const o of found) orders.push(await ensureTickets(o));
 
@@ -365,9 +496,15 @@ export const searchOrders = async (rawQ = "") => {
         phone: o.phone ?? "",
         tier: o.tier,
         quantity: o.quantity,
+        status: o.status,
         paidAt: o.paidAt ?? null,
+        createdAt: o.createdAt ?? null,
         accessKey: o.accessKey,
+        paymentMethod: publicMethod(o),
+        oxxoExpiresAt: o.stripe?.oxxoExpiresAt ?? null,
+        amount: o.stripe?.amountTotal != null ? o.stripe.amountTotal / 100 : o.expectedAmount,
         tickets: (o.tickets ?? []).map(publicTicket),
+        gifts: (o.gifts ?? []).map((g) => ({ code: g.code, mode: g.mode ?? "pending", usedAt: g.usedAt ?? null })),
     }));
 };
 
@@ -375,6 +512,8 @@ export const searchOrders = async (rawQ = "") => {
 const publicGift = (g) => ({
     code: g.code,
     message: g.message ?? "",
+    mode: g.mode ?? "pending",
+    sharedAt: g.sharedAt ?? null,
     status: g.status ?? "available",
     recipientName: g.recipientName ?? "",
     recipientPhone: g.recipientPhone ?? "",
@@ -383,25 +522,13 @@ const publicGift = (g) => ({
     usedAt: g.usedAt ?? null,
 });
 
-// Bienhechores pagados con sus regalos. Si una orden tiene menos regalos que
-// lugares (p. ej. pagada antes de este cambio), los completa sin mensaje.
+// Bienhechores pagados con sus regalos
 export const listGiftOrders = async () => {
-    const orders = await SanacionOrder.find({ tier: "bienhechor", status: "paid" })
+    const found = await SanacionOrder.find({ tier: "bienhechor", status: "paid" })
         .sort({ paidAt: -1 })
         .lean();
-
-    for (const o of orders) {
-        const have = o.gifts?.length ?? 0;
-        if (have < o.quantity) {
-            const extra = Array.from({ length: o.quantity - have }, () => newGift(""));
-            // el filtro evita duplicar si dos admins cargan a la vez
-            const res = await SanacionOrder.updateOne(
-                { _id: o._id, [`gifts.${have}`]: { $exists: false } },
-                { $push: { gifts: { $each: extra } } }
-            );
-            if (res.modifiedCount) o.gifts = [...(o.gifts ?? []), ...extra];
-        }
-    }
+    const orders = [];
+    for (const o of found) orders.push(await ensureTickets(o));
 
     return orders.map((o) => ({
         folio: o.folio,
@@ -410,6 +537,7 @@ export const listGiftOrders = async () => {
         quantity: o.quantity,
         paidAt: o.paidAt ?? null,
         source: o.source,
+        paymentMethod: publicMethod(o),
         gifts: (o.gifts ?? []).map(publicGift),
     }));
 };
@@ -420,8 +548,20 @@ export const updateGift = async (rawCode, body = {}) => {
     const set = {};
     let newCode = null;
 
+    const current = await SanacionOrder.findOne({ "gifts.code": code, status: "paid" }, { "gifts.$": 1 }).lean();
+    const gift = current?.gifts?.[0];
+    if (!gift) throw new HttpError(404, "No encontramos ese boleto de regalo.");
+
+    // Pasar a la Iglesia un regalo que el bienhechor no ha decidido
+    if (body.mode === "church") {
+        if ((gift.mode ?? "pending") === "shared") {
+            throw new HttpError(400, "El bienhechor ya compartió este lugar.");
+        }
+        set[p + "mode"] = "church";
+    }
+
     if (body.recipientName !== undefined) {
-        const n = String(body.recipientName).trim().replace(/\s+/g, " ");
+        const n = cleanName(body.recipientName);
         if (n.length > 120) throw new HttpError(400, "El nombre es demasiado largo.");
         set[p + "recipientName"] = n;
     }
@@ -432,6 +572,10 @@ export const updateGift = async (rawCode, body = {}) => {
     }
     if (body.status !== undefined) {
         if (!GIFT_STATUSES.includes(body.status)) throw new HttpError(400, "Estado no válido.");
+        if ((gift.mode ?? "pending") === "shared") {
+            throw new HttpError(400, "Este lugar lo compartió el propio bienhechor.");
+        }
+        set[p + "mode"] = "church"; // si la comunidad lo asigna, es de la Iglesia
         set[p + "status"] = body.status;
         if (body.status === "assigned") {
             set[p + "assignedAt"] = new Date();
@@ -439,13 +583,7 @@ export const updateGift = async (rawCode, body = {}) => {
         }
         if (body.status === "delivered") set[p + "deliveredAt"] = new Date();
         if (body.status === "available") {
-            const current = await SanacionOrder.findOne(
-                { "gifts.code": code, status: "paid" },
-                { "gifts.$": 1 }
-            ).lean();
-            if (current?.gifts?.[0]?.usedAt) {
-                throw new HttpError(400, "Este regalo ya se usó en la entrada; no se puede liberar.");
-            }
+            if (gift.usedAt) throw new HttpError(400, "Este regalo ya se usó en la entrada; no se puede liberar.");
             // Código nuevo: el QR que tenía la persona anterior deja de servir
             newCode = generateCode("REG", 6);
             set[p + "code"] = newCode;
@@ -482,6 +620,27 @@ const stripeFieldsFromSession = (session) => ({
 
 const compact = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 
+// Guarda cómo pagó (y la ficha OXXO si aplica). Si Stripe falla, no rompe el webhook.
+const savePaymentInfo = async (session, filter) => {
+    const piId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
+    try {
+        const info = await getPaymentInfo(piId);
+        if (!info) return;
+        await SanacionOrder.updateOne(
+            filter,
+            {
+                $set: compact({
+                    "stripe.paymentMethod": info.method,
+                    "stripe.oxxoVoucherUrl": info.oxxoVoucherUrl,
+                    "stripe.oxxoExpiresAt": info.oxxoExpiresAt,
+                }),
+            }
+        );
+    } catch (err) {
+        console.warn(`[sanacion] no se pudo leer el método de pago (${piId}):`, err.message);
+    }
+};
+
 const markPaid = async (session) => {
     const folio = session.client_reference_id;
     const fields = compact({ ...stripeFieldsFromSession(session), status: "paid", paidAt: new Date() });
@@ -494,15 +653,16 @@ const markPaid = async (session) => {
             { new: true }
         ).lean();
         if (updated) {
-            // Pago confirmado: genera un QR por lugar
+            // Pago confirmado: genera un QR por lugar (+ regalos si es Bienhechor)
             await ensureTickets(updated);
+            await savePaymentInfo(session, { _id: updated._id });
             // Stripe da el monto en centavos; avisa si no coincide con lo esperado
-            if (session.amount_total != null && session.amount_total !== updated.expectedAmount * 100) {
+            if (session.amount_total != null && session.amount_total !== Math.round(updated.expectedAmount * 100)) {
                 console.warn(
                     `[sanacion] ⚠️ monto distinto en ${updated.folio}: esperado ${updated.expectedAmount * 100}, cobrado ${session.amount_total}`
                 );
             }
-            return console.log(`[sanacion] ✅ pago confirmado ${updated.folio} (${updated.name}) · ${updated.quantity} QR`);
+            return console.log(`[sanacion] ✅ pago confirmado ${updated.folio} (${updated.name}) · ${updated.quantity} lugar(es)`);
         }
 
         if (await SanacionOrder.exists({ folio })) {
@@ -525,12 +685,13 @@ const markPaid = async (session) => {
                 expectedAmount: TIERS.bienhechor.price,
                 source: "stripe_direct",
                 tickets: [newTicket()],
-                gifts: [newGift("")],
+                gifts: [newGift("", "church")],
             },
             $set: fields,
         },
         { upsert: true }
     );
+    await savePaymentInfo(session, { "stripe.sessionId": session.id });
     console.log(`[sanacion] ✅ pago directo registrado (session ${session.id})`);
 };
 
@@ -542,6 +703,8 @@ const setStatusBySession = async (session, status) => {
         filter,
         { $set: compact({ ...stripeFieldsFromSession(session), status }) }
     );
+    // OXXO: guarda la ficha para que la persona pueda volver a verla
+    if (status === "processing") await savePaymentInfo(session, filter);
     console.log(`[sanacion] orden ${session.client_reference_id ?? session.id} -> ${status}`);
 };
 

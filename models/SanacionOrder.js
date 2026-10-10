@@ -4,6 +4,7 @@ const { Schema } = mongoose;
 
 export const ORDER_STATUS = ["pending", "processing", "paid", "expired", "failed"];
 export const GIFT_STATUS = ["available", "assigned", "delivered"];
+export const GIFT_MODE = ["pending", "shared", "church"];
 
 /* ───────────── Acceso (QR) ─────────────
  * Uno por lugar pagado. El QR contiene el `code`; al escanearlo en la
@@ -18,8 +19,11 @@ const ticketSchema = new Schema(
 );
 
 /* ───────────── Boleto de regalo ─────────────
- * Cada lugar Bienhechor genera uno. Lleva el mensaje que escribió el
- * bienhechor y la comunidad lo asigna/entrega desde /sanacion/admin.
+ * Cada lugar Bienhechor = 2 accesos: uno para quien compra (tickets) y
+ * uno de regalo (gifts). El regalo lo puede:
+ *   mode "pending": aún no decide qué hacer con él
+ *   mode "shared":  lo mandó él mismo por WhatsApp
+ *   mode "church":  lo donó a la Iglesia; la comunidad lo asigna en /sanacion/admin
  * Su `code` también es su QR de entrada.
  */
 const giftSchema = new Schema(
@@ -30,7 +34,11 @@ const giftSchema = new Schema(
         // Mensaje del bienhechor para quien lo reciba (opcional)
         message: { type: String, default: "", trim: true, maxlength: 280 },
 
-        // available: sin asignar · assigned: ya tiene destinatario · delivered: entregado
+        // Qué decidió el bienhechor hacer con este regalo
+        mode: { type: String, enum: GIFT_MODE, default: "pending" },
+        sharedAt: { type: Date, default: null },
+
+        // Sólo para mode "church": available → assigned → delivered (lo maneja el admin)
         status: { type: String, enum: GIFT_STATUS, default: "available" },
 
         recipientName: { type: String, default: "", trim: true, maxlength: 120 },
@@ -64,6 +72,7 @@ const sanacionOrderSchema = new Schema(
         },
 
         tier: { type: String, enum: ["general", "bienhechor"], required: true },
+        // Lugares comprados. En Bienhechor cada uno = 1 acceso propio + 1 de regalo.
         quantity: { type: Number, default: 1, min: 1, max: 10 },
 
         // Lo que esperábamos cobrar (pesos MXN)
@@ -78,7 +87,7 @@ const sanacionOrderSchema = new Schema(
         // "web" = creada por nuestra API · "stripe_direct" = alguien pagó con el link sin pasar por la página
         source: { type: String, enum: ["web", "stripe_direct"], default: "web" },
 
-        // Accesos con QR (se generan al confirmarse el pago): uno por lugar
+        // Accesos con QR para quien compra (se generan al confirmarse el pago): uno por lugar
         tickets: { type: [ticketSchema], default: [] },
 
         // Boletos de regalo (sólo Bienhechor): uno por lugar, con el mensaje del bienhechor
@@ -92,6 +101,15 @@ const sanacionOrderSchema = new Schema(
             currency: String,
             customerEmail: String,
             customerName: String,
+            // Cómo pagó: { type: "card" | "oxxo", brand, last4, wallet: "apple_pay" | "google_pay" | "" }
+            paymentMethod: {
+                type: { type: String },
+                brand: String,
+                last4: String,
+                wallet: String,
+            },
+            oxxoVoucherUrl: String, // ficha OXXO (mientras está pendiente)
+            oxxoExpiresAt: Date,
         },
     },
     { timestamps: true, collection: "sanacion_orders" }
