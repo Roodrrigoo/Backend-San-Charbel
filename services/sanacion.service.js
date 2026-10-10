@@ -314,7 +314,8 @@ export const getPass = async (rawKey) => {
  * POST /pass/:key/gifts/:code { action, recipientName? }
  *   share:       lo mandó por WhatsApp (queda "shared", con nombre opcional)
  *   church:      lo dona a la Iglesia
- *   reset:       cancela un envío/donación; el regalo vuelve a estar libre.
+ *   reset:       cancela un envío por WhatsApp; el regalo vuelve a estar libre.
+ *                Donar a la Iglesia es DEFINITIVO: un regalo donado no se puede recuperar.
  *                Si ya se había compartido, cambia el código: la liga anterior deja de servir.
  *   church-all:  dona todos los que aún no decide (code = "all")
  */
@@ -354,9 +355,8 @@ export const ownerGiftAction = async (rawKey, rawCode, body = {}) => {
         if (mode === "shared") throw new HttpError(400, "Este lugar ya lo compartiste. Cancela el envío primero.");
         set[p + "mode"] = "church";
     } else if (action === "reset") {
-        if (mode === "church" && (gift.status ?? "available") !== "available") {
-            throw new HttpError(400, "La comunidad ya asignó este lugar a alguien.");
-        }
+        // Donar a la Iglesia es definitivo
+        if (mode === "church") throw new HttpError(400, "Este lugar ya lo donaste a la Iglesia; esa decisión no se puede cambiar.");
         if (mode === "shared") set[p + "code"] = generateCode("REG", 6); // la liga enviada deja de servir
         set[p + "mode"] = "pending";
         set[p + "sharedAt"] = null;

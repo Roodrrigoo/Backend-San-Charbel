@@ -341,23 +341,39 @@ export const deleteVideo = async (id) => {
 /* ═════════════ ADMIN: SUBIR VIDEO DESDE EL DISPOSITIVO ═════════════
  * El navegador del admin sube el archivo directo a Cloudinary (no pasa por
  * Render). El backend sólo firma la subida para que nadie más pueda subir.
- * Variables (opcionales): CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+ * Variable (opcional): CLOUDINARY_URL=cloudinary://<api_key>:<api_secret>@<cloud_name>
+ * (cópiala tal cual de Cloudinary → Dashboard → "API environment variable")
  */
 const CLOUDINARY_FOLDER = "sanacion";
 
+const readCloudinaryUrl = () => {
+    const raw = String(process.env.CLOUDINARY_URL ?? "").trim().replace(/^CLOUDINARY_URL=/, "");
+    if (!raw) return null;
+    try {
+        const u = new URL(raw);
+        if (u.protocol !== "cloudinary:") return null;
+        const cfg = {
+            cloudName: decodeURIComponent(u.hostname),
+            apiKey: decodeURIComponent(u.username),
+            apiSecret: decodeURIComponent(u.password),
+        };
+        return cfg.cloudName && cfg.apiKey && cfg.apiSecret ? cfg : null;
+    } catch {
+        return null;
+    }
+};
+
 export const getUploadSignature = () => {
-    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
-    const apiKey = process.env.CLOUDINARY_API_KEY;
-    const apiSecret = process.env.CLOUDINARY_API_SECRET;
-    if (!cloudName || !apiKey || !apiSecret) {
+    const cfg = readCloudinaryUrl();
+    if (!cfg) {
         throw new HttpError(
             400,
-            "Falta configurar Cloudinary en el servidor (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET)."
+            "Falta configurar CLOUDINARY_URL en el servidor (cloudinary://API_KEY:API_SECRET@CLOUD_NAME)."
         );
     }
     const timestamp = Math.floor(Date.now() / 1000);
     // Cloudinary firma los parámetros en orden alfabético + el secreto (SHA-1)
     const toSign = `folder=${CLOUDINARY_FOLDER}&timestamp=${timestamp}`;
-    const signature = crypto.createHash("sha1").update(toSign + apiSecret).digest("hex");
-    return { cloudName, apiKey, timestamp, folder: CLOUDINARY_FOLDER, signature };
+    const signature = crypto.createHash("sha1").update(toSign + cfg.apiSecret).digest("hex");
+    return { cloudName: cfg.cloudName, apiKey: cfg.apiKey, timestamp, folder: CLOUDINARY_FOLDER, signature };
 };
