@@ -161,7 +161,7 @@ export const backfillPaidOrders = async () => {
 /* ───────────── Crear orden (antes de ir a Stripe) ─────────────
  * giftMode (sólo Bienhechor): "self" = los comparto yo · "church" = los dono a la Iglesia
  */
-export const createOrder = async ({ name, phone, tier = "bienhechor", quantity = 1, messages = [], giftMode = "self" }) => {
+export const createOrder = async ({ name, phone, tier = "bienhechor", quantity = 1, messages = [], giftMode = "self", payMethod }) => {
     const n = cleanName(name);
     if (n.length < 2) throw new HttpError(400, "Escribe tu nombre para emitir tu acceso.");
     if (n.length > 120) throw new HttpError(400, "El nombre es demasiado largo.");
@@ -220,10 +220,17 @@ export const createOrder = async ({ name, phone, tier = "bienhechor", quantity =
             folio: order.folio,
             priceId: tierConfig.priceId(),
             quantity: qty,
+            method: payMethod === "oxxo" || payMethod === "card" ? payMethod : undefined,
         });
         await SanacionOrder.updateOne(
             { _id: order._id },
-            { $set: { "stripe.sessionId": session.id } }
+            {
+                $set: {
+                    "stripe.sessionId": session.id,
+                    "stripe.checkoutUrl": session.url,
+                    "stripe.checkoutExpiresAt": session.expires_at ? new Date(session.expires_at * 1000) : undefined,
+                },
+            }
         );
         return { order, paymentUrl: session.url };
     } catch (err) {
@@ -282,6 +289,13 @@ const orderPass = (order) => {
         paymentMethod: publicMethod(order),
         oxxoVoucherUrl: order.status === "processing" ? order.stripe?.oxxoVoucherUrl ?? null : null,
         oxxoExpiresAt: order.status === "processing" ? order.stripe?.oxxoExpiresAt ?? null : null,
+        // Mientras no elija método de pago, la liga de WhatsApp le deja retomar el checkout
+        paymentUrl:
+            order.status === "pending" &&
+            order.stripe?.checkoutUrl &&
+            (!order.stripe?.checkoutExpiresAt || new Date(order.stripe.checkoutExpiresAt) > new Date())
+                ? order.stripe.checkoutUrl
+                : null,
     };
 };
 

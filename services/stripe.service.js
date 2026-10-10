@@ -23,14 +23,19 @@ export const constructWebhookEvent = (rawBody, signature) =>
  * El folio viaja en client_reference_id y vuelve en el webhook.
  * Los métodos de pago (tarjeta, OXXO…) se activan en el Dashboard de Stripe.
  */
-export const createCheckoutSession = ({ folio, priceId, quantity }) => {
+export const createCheckoutSession = ({ folio, priceId, quantity, method }) => {
     const site = process.env.SITE_URL;
     return getStripe().checkout.sessions.create({
         mode: "payment",
         line_items: [{ price: priceId, quantity }],
         client_reference_id: folio,
         locale: "es",
-        phone_number_collection: { enabled: true },
+        // La persona elige en nuestra página: tarjeta (incluye Apple Pay / Google Pay) u OXXO.
+        // Sin método elegido, Stripe muestra los que estén activos en el Dashboard.
+        ...(method === "card" ? { payment_method_types: ["card"] } : {}),
+        ...(method === "oxxo" ? { payment_method_types: ["oxxo"] } : {}),
+        // El WhatsApp ya lo pedimos en nuestra página; Stripe no vuelve a pedir teléfono.
+        // (El correo sí lo pide siempre Stripe Checkout: ahí manda el recibo y la ficha OXXO.)
         success_url: `${site}/sanacion?pago=ok`,
         cancel_url: `${site}/sanacion`,
     });
